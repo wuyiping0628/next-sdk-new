@@ -7,10 +7,17 @@
 1. `index.ts` 是用于导出 Vue 组件的包，供用户使用
 2. `App.vue` 是部署在服务器上，扫码访问的页面
 
-## 设想`Vue的开发用户`的使用流程：
+## 设想`Vue的开发用户`的使用流程
 
 ```html
-<tiny-remoter ref="remoterRef" v-model:show="showAiChat" :sessionId="sessionId" :title="项目名字">
+<tiny-remoter 
+  ref="remoterRef" 
+  v-model:show="showAiChat" 
+  :sessionId="sessionId" 
+  :title="项目名字"
+  :llmConfig="llmConfig"
+  :custom-market-mcp-servers="customMarketMcpServers"
+>
   <template #welcome>
     <!-- 自定义标题+图标
     自定义的Promts, 点击后调用 sendMessage()
@@ -28,6 +35,13 @@ import { TinyRemoter } from 'remoter'
 
 const showAiChat = ref(false)
 const remoterRef = ref()
+
+// 配置自定义LLM（可选）
+const llmConfig = {
+  apiKey: 'your-api-key',
+  baseURL: 'https://api.openai.com/v1',
+  providerType: 'openai'
+}
 
 // 1、 创建 server,client
 const [serverTransport, clientTransport] = createMessageChannelPairTransport()
@@ -62,7 +76,76 @@ createRemoter({
 // expose({  sendMessage, abortRequest,  messages,  messageState,senderRef})
 
 //  currentTemplate,  clearTemplate, 模板相关的功能先去掉，方便跨UI chat 框架适配。
+
+## LLM配置
+
+TinyRemoter组件支持自定义大语言模型配置，统一通过 `llmConfig` 传入：
+
+### 1. 使用 llmConfig.providerType 配置对象
+
+```typescript
+const llmConfig = {
+  apiKey: 'your-api-key',
+  baseURL: 'https://api.openai.com/v1',
+  providerType: 'openai' // 支持 'openai' | 'deepseek' 或自定义Provider函数
+}
 ```
+
+### 2. 使用自定义Provider实例（通过 llmConfig.llm）
+
+```typescript
+import { createOpenAI } from '@ai-sdk/openai'
+
+const customProvider = createOpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: 'https://api.openai.com/v1'
+})
+
+const llmConfig = {
+  llm: customProvider
+}
+```
+
+然后在组件中使用：
+
+```html
+<tiny-remoter 
+  :llmConfig="llmConfig"
+  :sessionId="sessionId" 
+/>
+```
+
+### 支持的提供商
+
+- OpenAI (`providerType: 'openai'`)
+- DeepSeek (`providerType: 'deepseek'`)
+- 其他ai-sdk兼容的提供商（通过自定义Provider函数）
+
+## 自定义 MCP 插件（customMcpServers）
+
+`TinyRemoter` 暴露 `customMarketMcpServers` 属性，用于在插件市场中追加自定义 MCP 插件。传入的数组会和组件内置的 `DEFAULT_SERVERS` 合并，示例：
+
+```ts
+const customMarketMcpServers = [
+  {
+    id: 'ppt-mcp',
+    name: 'PPT文档MCP服务器',
+    description: '可以创建、编辑、保存PPT文档',
+    icon: 'https://agent.opentiny.design/public-assets/icons/icon-ppt.png',
+    url: 'https://agent.opentiny.design/servers/ppt-mcp/sse',
+    type: 'sse',
+    enabled: false,
+    addState: 'idle',
+    tools: []
+  }
+]
+```
+
+- `id`：需要保持唯一性，对应插件注册名称（会拼成 `plugin-${id}`）
+- `type`：与后端 MCP 服务器协议保持一致，如 `sse`、`StreamableHTTP`
+- `enabled/addState/tools`：驱动 TinyRemoter 市场 UI 的状态字段
+
+在浏览器扩展侧，可通过 `packages/next-wxt/entrypoints/sidepanel/useCustomMarketMcpServers.ts` 自动聚合 `meta.ts` 定义的 `customMarketMcpServers`，再传入 `TinyRemoter`。
 
 ## 构建发包
 

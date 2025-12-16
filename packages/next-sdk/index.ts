@@ -7,6 +7,7 @@ export { ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 export { UriTemplate } from '@modelcontextprotocol/sdk/shared/uriTemplate.js'
 export { completable } from '@modelcontextprotocol/sdk/server/completable.js'
 export { getDisplayName } from '@modelcontextprotocol/sdk/shared/metadataUtils.js'
+export { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 export type * from 'zod'
 export type * from '@opentiny/next'
 export type * from '@modelcontextprotocol/sdk/types.js'
@@ -20,8 +21,13 @@ export type * from '@modelcontextprotocol/sdk/server/mcp.js'
 export * from './WebMcpServer'
 export * from './WebMcpClient'
 
+// 浏览器扩展自定义传输层
+export * from './transport/ExtensionClientTransport'
+export * from './transport/ExtensionPageServerTransport'
+export * from './transport/ExtensionContentServerTransport'
+
 // 快速创建一个悬浮图标和菜单，是扫码和聊天框的入口
-export { createRemoter } from './remoter/createRemoter'
+export * from './remoter/createRemoter'
 
 // 一个通用的ai-sdk的agent封装
 export { AgentModelProvider } from './agent/AgentModelProvider'

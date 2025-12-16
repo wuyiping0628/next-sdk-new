@@ -8,15 +8,24 @@
       <tr-icon-button :icon="IconHistory" size="28" svgSize="20" @click="showHistory = !showHistory" />
       <QrCodeScan @scanSuccess="handleScanSuccess" />
 
-      <TrHistory
-        v-show="showHistory"
-        class="tr-history-demo"
-        tab-title="历史会话"
-        :selected="conversationState.currentId"
-        :data="conversationState.conversations"
-        @close="showHistory = false"
-        @item-click="handleHistorySelect"
-      ></TrHistory>
+      <!-- 历史会话抽屉 -->
+      <Transition name="drawer-slide" appear>
+        <div v-if="showHistory" class="drawer-overlay" @click="showHistory = false">
+          <div class="drawer-container" @click.stop style="--tr-history-item-selected-bg: #ebeeff">
+            <h4>历史会话</h4>
+            <TrHistory
+              class="tr-history-demo"
+              :selected="conversationState.currentId"
+              :data="conversationState.conversations"
+              :showRenameControls="true"
+              @close="showHistory = false"
+              @item-click="handleHistorySelect"
+              @item-title-change="handleHistoryUpdateTitle"
+              @item-action="handleHistoryDelete"
+            ></TrHistory>
+          </div>
+        </div>
+      </Transition>
     </template>
     <tr-bubble-provider :content-renderers="contentRenderer">
       <slot name="welcome" v-if="messages.length === 0">
@@ -39,7 +48,7 @@
     </tr-bubble-provider>
 
     <template #footer>
-      <div class="chat-input">
+      <div class="chat-input" @keydown="handleKeyDown">
         <slot name="suggestions">
           <div class="chat-input-pills">
             <tr-dropdown-menu
@@ -63,9 +72,11 @@
           :clearable="!!inputMessage"
           :loading="senderLoading"
           :showWordLimit="true"
-          :maxLength="1000"
-          @submit="handleSendMessage"
+          :maxLength="20000"
+          @submit="handleSendMessageCustom"
           @cancel="abortRequest"
+          v-model:template-data="templateData"
+          @trigger-char="handleTriggerChar"
         >
           <template #footer-left>
             <div class="sender-left-icon">
@@ -75,12 +86,25 @@
           </template>
         </tr-sender>
 
+        <!-- @角色功能 未来移除 -->
+        <SkillSelector
+          ref="skillSelectorRef"
+          :visible="showSkillSelector"
+          :skills="skills"
+          :position="skillSelectorPosition"
+          :filter-text="filterText"
+          @select="selectSkill"
+          @close="closeSkillSelector"
+        />
+
         <!-- 插件面板 -->
         <TrMcpServerPicker
           v-model:visible="pluginVisible"
           :popup-config="{ type: 'drawer' }"
           :show-custom-add-button="false"
-          marketTabTitle="MCP 市场"
+          marketTabTitle="MCP市场"
+          installedTabTitle="已添加MCP服务"
+          title="扩展"
           :installedPlugins="installedPlugins"
           :marketPlugins="marketPlugins"
           :market-category-options="marketCategoryOptions"
@@ -91,6 +115,10 @@
           @plugin-delete="handlePluginDelete"
           @tool-toggle="handleToolToggle"
         >
+          <template #header-actions>
+            <!-- @vue-ignore -->
+            <slot name="header-actions" />
+          </template>
         </TrMcpServerPicker>
       </div>
     </template>
@@ -115,16 +143,25 @@ import {
   type MarketCategoryOption,
   type PluginTool
 } from '@opentiny/tiny-robot'
-import { PromptProps } from '@opentiny/tiny-robot'
+
+import { CustomFunction } from './customFunction'
+import { SchemaRenderer, RENDERER_SETTINGS_KEY } from '@opentiny/genui-sdk-vue'
+
 import { GeneratingStatus, STATUS } from '@opentiny/tiny-robot-kit'
 import { IconNewSession, IconPlugin, IconHistory } from '@opentiny/tiny-robot-svgs'
 import { useTinyRobotChat } from '../composable/useTinyRobotChat'
-import { h, CSSProperties, toRef, computed, ref, onMounted } from 'vue'
+import { toRef, computed, ref, onMounted, markRaw, h, watch, provide, nextTick } from 'vue'
 import { createRemoter, McpServerConfig } from '@opentiny/next-sdk'
 import QrCodeScan from './qr-code-scan.vue'
 import { DEFAULT_SERVERS } from './default-mcps'
 import { defaultPluginSrc } from './default-plugin-svg'
-import { SYSTEM_PROMPT } from '../const'
+import { getLang, mapMake } from './lang'
+import { handleError } from './error-handle'
+import { ICustomAgentModelProviderLlmConfig } from '../types/type'
+import type { MenuItemConfig } from '@opentiny/next-sdk'
+import { type SkillOption } from './SkillSelector.vue'
+import SkillSelector from './SkillSelector.vue'
+import { useSkill } from '../composable/useSkill'
 
 defineOptions({
   name: 'TinyRemoter'
@@ -144,7 +181,7 @@ const props = defineProps({
   /** 系统提示词 */
   systemPrompt: {
     type: String,
-    default: SYSTEM_PROMPT
+    default: '你是一个智能生活助手，擅长通过工具调用帮助用户完成任务'
   },
   /** 左上角的标题 */
   title: {
@@ -156,6 +193,16 @@ const props = defineProps({
     type: String,
     default: 'zh-CN'
   },
+  remoteUrl: {
+    type: String
+  },
+  menuItems: {
+    type: Array as () => MenuItemConfig[],
+    default: () => []
+  },
+  qrCodeUrl: {
+    type: String
+  },
   /** 展示模式： 'remoter' | 'chat-dialog'
    * 遥控器模式： 自动在右下角显示一个AI图标，点击展开多个菜单项。
    * 对话框模式： 直接显示一个对话框界面
@@ -163,11 +210,88 @@ const props = defineProps({
   mode: {
     type: String,
     default: 'remoter'
+  },
+  /** 大语言模型配置对象 */
+  llmConfig: {
+    type: Object as () => ICustomAgentModelProviderLlmConfig | undefined,
+    default: undefined
+  },
+  /** 设置组件运行在普通页面还是浏览器的扩展中 */
+  inBrowserExt: {
+    type: Boolean,
+    default: false
+  },
+  /** 是否启用生成式UI */
+  genUiAble: {
+    type: Boolean,
+    default: true
+  },
+  /** 生成式UI 需要引入的组件。生成式UI内置了一批组件，如果需要引入新组件，需要通过这里导入。
+   * 参考示例： shallowReactive({TinyUser, TinyAlert }) */
+  genUiComponents: {
+    type: Object,
+    default: () => ({})
+  },
+  /** 自定义 MCP 市场服务列表 */
+  customMarketMcpServers: {
+    type: Array as () => PluginInfo[],
+    default: () => []
+  },
+
+  skills: {
+    type: Object as () => SkillOption[],
+    default: () => ({})
   }
 })
 
+if (props.inBrowserExt) {
+  provide(RENDERER_SETTINGS_KEY, {
+    Function: CustomFunction
+  })
+}
+
 const fullscreen = defineModel('fullscreen', { type: Boolean, default: false })
 const show = defineModel('show', { type: Boolean, default: false })
+
+// 自定义消息渲染器 ---- 默认支持markdown 和 生成式UI（生成式UI有很多流处理，不容易解耦出来，所以统一处理）
+const contentRenderer = {
+  markdown: new BubbleMarkdownContentRenderer({ mdConfig: { html: true } }),
+  'schema-card': (schemaCardProps: any) =>
+    h(SchemaRenderer, {
+      ...schemaCardProps,
+      onAction: ({ llmFriendlyMessage, humanFriendlyMessage }: any) => {
+        addMessage({
+          role: 'user',
+          content: llmFriendlyMessage,
+          uiContent: [{ type: 'text', content: humanFriendlyMessage }]
+        })
+        send()
+      },
+      generating: GeneratingStatus.includes(messageState.status),
+      customComponents: props.genUiComponents,
+      requiredCompleteFieldSelectors: ['[componentName=TinyUser] > props > modelValue']
+    })
+}
+
+// 对接 mcp server picker 组件
+const pluginVisible = ref(false)
+
+// 已安装插件数据
+const installedPlugins = ref<PluginInfo[]>([])
+
+// 市场插件数据
+const marketPlugins = ref<PluginInfo[]>([...DEFAULT_SERVERS, ...props.customMarketMcpServers])
+
+// 市场分类选项
+const marketCategoryOptions = ref<MarketCategoryOption[]>([
+  { value: '', label: '全部分类' },
+  { value: 'productivity', label: '生产力工具' },
+  { value: 'communication', label: '沟通协作' },
+  { value: 'development', label: '开发工具' },
+  { value: 'ai', label: 'AI 助手' }
+])
+
+const { lang, pillItems, promptItems } = getLang(props)
 
 const {
   showHistory,
@@ -182,29 +306,109 @@ const {
   senderRef,
   sendMessage,
   handleSendMessage,
-  createConversation,
+  handleHistoryUpdateTitle,
+  handleHistoryDelete,
   handleHistorySelect,
-  handleCreateConversation
+  handleCreateConversation,
+  addMessage,
+  send
 } = useTinyRobotChat({
   sessionId: toRef(props, 'sessionId'),
   agentRoot: toRef(props, 'agentRoot'),
-  systemPrompt: props.systemPrompt || ''
+  systemPrompt: props.systemPrompt || '',
+  llmConfig: props.llmConfig,
+  skills: props.skills || [] // 传递 skills 列表给 useTinyRobotChat
 })
 
-const lang: Record<string, { title: string; description: string; placeholder: string; thinking: string }> = {
-  'zh-CN': {
-    title: 'OpenTiny NEXT',
-    description: '我是你的私人智能助手',
-    placeholder: '请输入您的问题',
-    thinking: '正在思考中...'
-  },
-  'en-US': {
-    title: 'OpenTiny NEXT',
-    description: 'I am your private AI assistant',
-    placeholder: 'Please enter your question',
-    thinking: 'Thinking...'
+/**
+ * 处理 MCP Client 断开事件
+ * 自动清理已断开的插件和资源
+ */
+const handleClientDisconnected = async (serverName: string) => {
+  // 从 serverName 提取 pluginId (格式: mcp-server-xxx)
+  const pluginId = serverName.replace('mcp-server-', '')
+  const fullPluginId = `plugin-${pluginId}`
+
+  // 查找对应的插件
+  const plugin = installedPlugins.value.find((p) => p.id === fullPluginId)
+
+  // 从 Agent 中移除 MCP Server
+  await agent.removeMcpServer(serverName)
+
+  if (plugin) {
+    // 从已安装插件列表中移除
+    installedPlugins.value = installedPlugins.value.filter((p) => p.id !== fullPluginId)
+
+    // 还原市场插件状态（如果存在）
+    const marketPlugin = marketPlugins.value.find((p) => p.id === fullPluginId)
+    if (marketPlugin) {
+      marketPlugin.addState = 'idle'
+    }
+
+    // 显示提示
+    showToast(`工具 "${plugin.name}" 已断开连接`)
   }
 }
+
+// 处理扫码结果。 把结果添加到 agent.mcpServers， 以及 插入McpServerPicker的一个Plugin
+const handleScanSuccess = async (sessionId: string) => {
+  showLoadingToast('添加工具中...')
+
+  if (sessionId) {
+    const mcpServer = {
+      type: 'streamableHttp',
+      url: `${props.agentRoot}mcp?sessionId=${sessionId}`
+    } as const
+    const serverName = `mcp-server-${sessionId}`
+    // 1、 插入McpServers, 此时内部会判断重复。  不重复则插入，并连接和查询tools到agent上。
+    const inserted = await agent.insertMcpServer(serverName, mcpServer)
+
+    if (inserted) {
+      await loadMcpServerToPlugin(serverName, mcpServer)
+      await agent.closeAll()
+      showToast('添加工具完成')
+    } else {
+      showToast('重复添加工具')
+    }
+  } else {
+    showToast('添加工具失败')
+  }
+}
+
+const handleSendMessageCustom = async (inputValue: string, templateDataParam?: any[]) => {
+  const input = inputMessage.value
+  if (/^\/[A-Za-z0-9-]{6,}$/.test(input)) {
+    const res = await fetch(`${props.agentRoot}client?sessionId=${input.slice(1)}`).then((res) => res.json())
+    const sessionId = res?.data?.sessionId
+
+    if (sessionId) {
+      await handleScanSuccess(sessionId)
+    } else {
+      showToast('添加工具失败,请检查识别码是否正确')
+    }
+
+    inputMessage.value = ''
+  } else {
+    // 保存当前的 templateData，以便在工具检查失败时恢复
+    // 优先使用 templateDataParam（tr-sender 传递的），如果没有则使用 templateData.value
+    const savedTemplateData = templateDataParam
+      ? [...templateDataParam]
+      : templateData.value.length > 0
+        ? [...templateData.value]
+        : undefined
+    const success = await handleSendMessage(inputValue, templateDataParam)
+
+    // 如果工具检查失败，恢复 templateData，避免输入框被清空
+    if (!success && savedTemplateData) {
+      // 使用 nextTick 确保在 tr-sender 组件清空后再恢复
+      nextTick(() => {
+        templateData.value = savedTemplateData
+      })
+    }
+  }
+}
+
+const LOCAL_TOOL_STORAGE_KEY = 'local-tool-storage'
 
 // 自动计算的变量
 const senderPlaceholder = computed(() =>
@@ -213,113 +417,50 @@ const senderPlaceholder = computed(() =>
 
 const senderLoading = computed(() => GeneratingStatus.includes(messageState.status))
 
-// 默认的Prompts。 仅做为介绍性文字，点击不触发事件
-const promptItems: PromptProps[] = [
-  {
-    label: props.locale === 'zh-CN' ? '企业办公助手' : 'Enterprise Office Assistant',
-    description:
-      props.locale === 'zh-CN'
-        ? '需要我帮你处理邮件、安排会议、整理文档，还是优化工作流程？'
-        : 'Need help with emails, meeting scheduling, document organization, or workflow optimization?',
-    icon: h('span', { style: { fontSize: '18px' } as CSSProperties }, '🧠'),
-    badge: 'NEW'
-  },
-  {
-    label: props.locale === 'zh-CN' ? '开发技术支持' : 'Development Support',
-    description:
-      props.locale === 'zh-CN'
-        ? '遇到代码问题？需要架构建议？还是想了解最新的技术趋势？'
-        : 'Facing code issues? Need architecture advice? Or want to learn about latest tech trends?',
-    icon: h('span', { style: { fontSize: '18px' } as CSSProperties }, '💻')
-  },
-  {
-    label: props.locale === 'zh-CN' ? '项目管理协作' : 'Project Management',
-    description:
-      props.locale === 'zh-CN'
-        ? '需要项目规划、任务分配、进度跟踪，还是团队协作建议？'
-        : 'Need project planning, task assignment, progress tracking, or team collaboration advice?',
-    icon: h('span', { style: { fontSize: '18px' } as CSSProperties }, '📊')
-  }
-]
-
-// 默认的 SuggestionPills
-const mapMake = (str: string, id: number) => {
-  const [text, inputMessage] = str.split('#')
-  return { id, text, inputMessage }
-}
-const pillItems = [
-  {
-    id: 'office',
-    text: props.locale === 'zh-CN' ? '办公助手' : 'Office Assistant',
-    menus: [
-      '接收邮件#请同步邮箱的新邮件。',
-      '编写邮件#请新建一个邮件，收件人为 opentiny-next@meeting.com, 内容为举办一个临时会议。',
-      '安排会议#创建一个临时的在线会议，主题为讨论问题，时长为1小时。',
-      '整理文档#请分析附件中的销售情况，把销售额绘制成折线图。'
-    ].map(mapMake)
-  },
-  {
-    id: 'development',
-    text: props.locale === 'zh-CN' ? '开发支持' : 'Development Support',
-    menus: [
-      '遇到代码问题#请检查当前位置的报错原因。',
-      '架构建议#请使用NodeJs实现一个分块上传文件的模块。',
-      '最新的技术趋势#请分析Vue与React 框架的优劣分别是什么？'
-    ].map(mapMake)
-  },
-  {
-    id: 'management',
-    text: props.locale === 'zh-CN' ? '项目管理' : 'Project Management',
-    menus: [
-      '项目规划#如何开展品牌推广的活动？',
-      '任务分配#将本季度的销售任务分配给三个人，并生成甘特图进行跟踪。',
-      '进度跟踪#分析团队的任务完成情况。'
-    ].map(mapMake)
-  }
-]
 const handlePillItemClick = (item: ReturnType<typeof mapMake>) => {
   inputMessage.value = item.inputMessage
 }
 
-// 处理扫码结果。 把结果添加到 agent.mcpServers， 以及 插入McpServerPicker的一个Plugin
-const handleScanSuccess = async (decodedText: string) => {
-  const url = new URL(decodedText)
-  const sessionId = url.searchParams.get('sessionId')
+const loadMcpServerToPlugin = async (serverName: string, mcpServer: McpServerConfig) => {
+  const LOCAL_TOOL_STORAGE = JSON.parse(localStorage.getItem(LOCAL_TOOL_STORAGE_KEY) || '{}')
+  const isLocalTool = serverName === 'mcp-server-localhost'
+  const url = isLocalTool ? { origin: '本地工具' } : new URL('url' in mcpServer ? mcpServer.url : '')
+  const sessionId = isLocalTool
+    ? '本地工具列表'
+    : url.searchParams.get('sessionId') || ('sessionId' in mcpServer ? mcpServer.sessionId : '') || ''
 
-  if (sessionId) {
-    const mcpServer = {
-      type: 'streamableHttp',
-      url: `${props.agentRoot}mcp?sessionId=${sessionId}`
-    } as const
-    // 1、 插入McpServers, 此时内部会判断重复。  不重复则插入，并连接和查询tools到agent上。
-    const inserted = await agent.insertMcpServer(mcpServer)
-
-    if (inserted) {
-      loadMcpServerToPlugin(mcpServer)
-    }
-  }
-}
-
-function loadMcpServerToPlugin(mcpServer: McpServerConfig) {
-  // 先查找 index, 由它可以找到相应的 client, tool
-  const index = agent.mcpServers.findIndex((svc) => svc.url === mcpServer.url)
-  // 解析url, 获得sessionId
-  const url = new URL(mcpServer.url)
-  const sessionId = url.searchParams.get('sessionId') || ''
-  // 查询 tools
-  const currTool = agent.mcpTools[index]
+  // 直接使用 serverName 获取 tools，无需索引查找
+  const currTool = agent.mcpTools[serverName]
   if (currTool) {
     let pluginTools: PluginTool[] = []
     pluginTools = Object.keys(currTool).map((key) => {
+      const enabled = isLocalTool ? Boolean(LOCAL_TOOL_STORAGE[key]) : true
+      agent.ignoreToolnames = agent.ignoreToolnames.filter((name) => name !== key)
+      if (!enabled) {
+        agent.ignoreToolnames.push(key)
+      }
       return {
         id: key,
         name: key,
         description: currTool[key].description as string,
-        enabled: true
+        enabled
       }
     })
+
+    const pluginId = `plugin-${sessionId}`
+
+    // 检查是否已存在相同的插件，避免重复添加
+    const existingPlugin = installedPlugins.value.find((plugin) => plugin.id === pluginId)
+    if (existingPlugin) {
+      // 如果插件已存在，更新其工具列表和配置
+      existingPlugin.tools = pluginTools
+      // @ts-ignore
+      existingPlugin.originMcpConfig = markRaw(mcpServer) as McpServerConfig
+      return
+    }
+
     const plugin: PluginInfo = {
-      id: `plugin-${sessionId}`,
+      id: pluginId,
       name: url.origin,
       icon: defaultPluginSrc,
       description: sessionId,
@@ -327,33 +468,38 @@ function loadMcpServerToPlugin(mcpServer: McpServerConfig) {
       expanded: true,
       tools: pluginTools,
       // @ts-ignore
-      originMcpConfig: mcpServer // 缓存对应的mcpServers中的一个引用
+      originMcpConfig: markRaw(mcpServer) // 缓存对应的mcpServers中的一个引用
     }
 
     installedPlugins.value.push(plugin)
-  } else {
-    agent.removeMcpServer(mcpServer)
   }
 }
-// 页面加载时，要判断 agent上，初始就加载的 agent.mcpServer，加载后记录在 agent.mcpTools下
+
 onMounted(async () => {
   // 统一报错
   agent.onError = (msg) => {
-    msg && showToast(msg)
+    msg && showToast(handleError(msg))
   }
 
-  await agent.initClientsAndTools()
-  agent.mcpServers.forEach((mcpServer) => {
-    loadMcpServerToPlugin(mcpServer)
-  })
-
-  // 每次chat的过程中，更新 tools 后，已安装的插件需要同步一次
+  // 每次chat的过程中会自动更新 tools ，所以已安装的插件需要同步一次
   agent.onUpdatedTools = () => {
     installedPlugins.value.forEach((plugin) => {
-      const mcpServer = plugin.originMcpConfig
-      const index = agent.mcpServers.findIndex((server) => server === mcpServer)
-      if (index !== -1) {
-        const currTool = agent.mcpTools[index]
+      // 通过插件ID找到对应的服务器名称
+      const serverName = `mcp-server-${plugin.id.replace('plugin-', '')}`
+
+      // 直接使用 serverName 获取 client 和 tool，无需索引查找
+      const currClient = agent.mcpClients[serverName]
+      const currTool = agent.mcpTools[serverName]
+
+      // 先判断client 在不在， 不存在后，标记一个 (断)
+      if (currClient === null) {
+        plugin.name = '❌' + plugin.name.replace('❌', '')
+      }
+
+      // 判断 tool是不是 null, 是null则全部禁用
+      if (currTool === null) {
+        plugin.tools.forEach((tool) => (tool.enabled = false))
+      } else if (currTool) {
         plugin.tools = Object.keys(currTool).map((key) => {
           return {
             id: key,
@@ -365,54 +511,88 @@ onMounted(async () => {
       }
     })
   }
+
+  // 初始加载时，url上的sessionId 可能是1个或多个，此时要立即连接后，更新一下插件状态
+  await agent.initClientsAndTools()
+  await agent.closeAll()
+
+  for (const [serverName, mcpServer] of Object.entries(agent.mcpServers)) {
+    await loadMcpServerToPlugin(serverName, mcpServer)
+  }
 })
 
-// 自定义消息渲染器
-const contentRenderer = { markdown: new BubbleMarkdownContentRenderer({ mdConfig: { html: true } }) }
-
 // 如果是遥控器模式，则初始化右下角的AI 图标
-if (props.mode === 'remoter') {
-  createRemoter({
-    sessionId: props.sessionId,
-    onShowAIChat: () => {
-      show.value = true
+let isCreateRemoter = false
+watch(
+  () => props.sessionId,
+  (value) => {
+    if (value && props.mode === 'remoter' && !isCreateRemoter) {
+      createRemoter({
+        sessionId: props.sessionId,
+        qrCodeUrl: props.qrCodeUrl,
+        remoteUrl: props.remoteUrl,
+        menuItems: props.menuItems,
+        onShowAIChat: () => (show.value = true)
+      })
+
+      isCreateRemoter = true
     }
-  })
-}
-
-// 对接 mcp server picker 组件
-const pluginVisible = ref(false)
-
-// 已安装插件数据
-const installedPlugins = ref<PluginInfo[]>([])
-
-// 市场插件数据
-const marketPlugins = ref<PluginInfo[]>([...DEFAULT_SERVERS])
-
-// 市场分类选项
-const marketCategoryOptions = ref<MarketCategoryOption[]>([
-  { value: '', label: '全部分类' },
-  { value: 'productivity', label: '生产力工具' },
-  { value: 'communication', label: '沟通协作' },
-  { value: 'development', label: '开发工具' },
-  { value: 'ai', label: 'AI 助手' }
-])
+  },
+  { immediate: true }
+)
+// 后续的每次sessionId变化，都认为是扫码添加了
+watch(
+  () => props.sessionId,
+  (value) => {
+    if (value) {
+      handleScanSuccess(value)
+    }
+  }
+)
 
 // 整个插件的打开或关闭
-const handlePluginToggle = (plugin: PluginInfo, enabled: boolean) => {
-  // Keep empty!
+const handlePluginToggle = (_plugin: PluginInfo, enabled: boolean) => {
+  const isLocalTool = _plugin.id === 'plugin-本地工具列表'
+  const LOCAL_TOOL_STORAGE = JSON.parse(localStorage.getItem(LOCAL_TOOL_STORAGE_KEY) || '{}')
+  _plugin.tools.forEach((tool) => {
+    tool.enabled = enabled
+    if (enabled) {
+      agent.ignoreToolnames = agent.ignoreToolnames.filter((name) => name !== tool.id)
+    } else {
+      agent.ignoreToolnames.push(tool.id)
+    }
+  })
+
+  if (isLocalTool) {
+    Object.keys(LOCAL_TOOL_STORAGE).forEach((key) => {
+      LOCAL_TOOL_STORAGE[key] = enabled
+    })
+    localStorage.setItem(LOCAL_TOOL_STORAGE_KEY, JSON.stringify(LOCAL_TOOL_STORAGE))
+  }
 }
 
 // 某个tool的打开或关闭。  全部tool状态一致时，会同时触发handlePluginToggle 一下。
-const handleToolToggle = (plugin: PluginInfo, toolId: string, enabled: boolean) => {
+const handleToolToggle = (_plugin: PluginInfo, toolId: string, enabled: boolean) => {
+  const LOCAL_TOOL_STORAGE = JSON.parse(localStorage.getItem(LOCAL_TOOL_STORAGE_KEY) || '{}')
+  const isLocalTool = _plugin.id === 'plugin-本地工具列表'
+
+  _plugin.tools.forEach((tool) => {
+    if (tool.id === toolId) {
+      tool.enabled = enabled
+    }
+  })
   if (enabled) {
     agent.ignoreToolnames = agent.ignoreToolnames.filter((name) => name !== toolId)
   } else {
     agent.ignoreToolnames.push(toolId)
   }
+  if (isLocalTool) {
+    LOCAL_TOOL_STORAGE[toolId] = enabled
+    localStorage.setItem(LOCAL_TOOL_STORAGE_KEY, JSON.stringify(LOCAL_TOOL_STORAGE))
+  }
 }
 // 点垃圾桶图标的插件删除
-const handlePluginDelete = (plugin: PluginInfo) => {
+const handlePluginDelete = async (plugin: PluginInfo) => {
   // 从安装插件删除， 市场插件还原状态。
   const delPlugin = installedPlugins.value.find((item) => item.id === plugin.id)
   if (delPlugin) {
@@ -423,11 +603,13 @@ const handlePluginDelete = (plugin: PluginInfo) => {
     }
 
     // 移除mcpServers，mcpTools，mcpClients，ignoreToolnames
-    agent.removeMcpServer(delPlugin.originMcpConfig)
+    // 通过插件ID找到对应的服务器名称
+    const serverName = `mcp-server-${plugin.id.replace('plugin-', '')}`
+    await agent.removeMcpServer(serverName)
   }
 }
-// 插件市场中，点击“添加”
-const handlePluginAdd = async (plugin: PluginInfo, isAdd: boolean) => {
+// 插件市场中，点击"添加"
+const handlePluginAdd = async (plugin: PluginInfo) => {
   plugin.addState = 'loading'
 
   const newPlugin = {
@@ -437,14 +619,12 @@ const handlePluginAdd = async (plugin: PluginInfo, isAdd: boolean) => {
   }
 
   // 立即注册服务，查询工具
-  const mcpServer = { type: plugin.type, url: plugin.url }
-  const inserted = await agent.insertMcpServer(mcpServer) // 插入时，会自动去重，且initClientAndTools
-
+  const mcpServer = { type: (plugin as any).type, url: (plugin as any).url, useAISdkClient: true } as McpServerConfig
+  const serverName = `mcp-server-${plugin.id}`
+  const inserted = await agent.insertMcpServer(serverName, mcpServer) // 插入时，会自动去重，且initClientAndTools
   if (inserted) {
-    newPlugin.originMcpConfig = mcpServer
-    const index = agent.mcpServers.findIndex((svc) => svc.url === mcpServer.url)
-    // 查询 tools
-    const currTool = agent.mcpTools[index]
+    // 直接使用 serverName 获取 tools，无需索引查找
+    const currTool = agent.mcpTools[serverName]
     if (currTool) {
       newPlugin.tools = Object.keys(currTool).map((key) => {
         return {
@@ -454,13 +634,14 @@ const handlePluginAdd = async (plugin: PluginInfo, isAdd: boolean) => {
           enabled: true
         }
       })
-      installedPlugins.value.push(newPlugin) // 只有client.tools() 成功了，才显示到“已安装列表”
+      installedPlugins.value.push(newPlugin) // 只有client.tools() 成功了，才显示到"已安装列表"
       plugin.addState = 'added'
+      await agent.closeAll()
       return
     }
   }
   // 添加失败
-  agent.removeMcpServer(mcpServer)
+  await agent.removeMcpServer(serverName)
   plugin.addState = 'idle'
 }
 
@@ -477,6 +658,8 @@ defineSlots<{
 
 // 定义输出：  暴露一些重要方法，方便用户写插槽时，可以使用。
 defineExpose({
+  /** 大模型代理 */
+  agent,
   /** 欢迎图标 */
   welcomeIcon,
   /** 对话消息 */
@@ -492,8 +675,26 @@ defineExpose({
   /** 取消发送 */
   abortRequest,
   /** 发送消息 */
-  sendMessage
+  sendMessage,
+  /** 向插件市场添加一个server */
+  loadMcpServerToPlugin,
+  /** mcp client断开时，自动清理已断开的插件和资源  */
+  handleClientDisconnected
 })
+
+// TODO 未来版本移除
+const {
+  templateData,
+  showSkillSelector,
+  skillSelectorPosition,
+  filterText,
+  skillSelectorRef,
+
+  handleTriggerChar,
+  selectSkill,
+  closeSkillSelector,
+  handleKeyDown
+} = useSkill(inputMessage, senderRef, props)
 </script>
 
 <style scoped lang="less">
@@ -501,6 +702,7 @@ defineExpose({
 .chat-input {
   margin-top: 8px;
   padding: 10px 15px;
+  position: relative;
 }
 
 .tr-container {
@@ -586,16 +788,69 @@ defineExpose({
   :deep(.mcp-server-picker.popup-type-drawer) {
     width: 100% !important;
   }
+
+  /* 移动端抽屉样式优化 */
+  .drawer-container {
+    width: 85%;
+    max-width: none;
+  }
+}
+
+/* 抽屉动画样式 */
+.drawer-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--tr-z-index-popover);
+  background-color: rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(2px);
+}
+
+.drawer-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 76%;
+  max-width: 400px;
+  background: white;
+  box-shadow: 4px 0 20px rgba(0, 0, 0, 0.1);
+  transform: translateX(0);
+
+  padding: 0 24px 24px 24px;
+}
+
+/* 抽屉滑入滑出动画 */
+.drawer-slide-enter-active,
+.drawer-slide-leave-active {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.drawer-slide-enter-active .drawer-container,
+.drawer-slide-leave-active .drawer-container {
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.drawer-slide-enter-from {
+  opacity: 0;
+}
+
+.drawer-slide-enter-from .drawer-container {
+  transform: translateX(-100%);
+}
+
+.drawer-slide-leave-to {
+  opacity: 0;
+}
+
+.drawer-slide-leave-to .drawer-container {
+  transform: translateX(-100%);
 }
 
 .tr-history-demo {
-  position: absolute !important;
-  right: 134px;
-  top: 85px;
-
-  z-index: var(--tr-z-index-popover);
-  width: 300px;
-  height: 600px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+  height: 100%;
+  width: 100%;
 }
 </style>

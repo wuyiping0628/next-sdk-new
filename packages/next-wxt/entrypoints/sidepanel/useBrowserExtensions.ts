@@ -1,0 +1,235 @@
+import { type McpServerConfig } from '@opentiny/next-sdk'
+import { onMounted } from 'vue'
+import { createMcpServer } from './mcpServer'
+import { TinyRemoter } from '@opentiny/next-remoter'
+
+// Session 注册表：sessionId → {tabIds, serverInfo, timestamp}
+// 用于 Port 连接时查找 Server 所在的 tabs（支持同域名多页签）
+const sessionRegistry = new Map<string, { tabIds: number[]; serverInfo: any; timestamp: number }>()
+// 主机名映射表：host → tabIds[]（支持同域名多页签）
+const hostNameMap = new Map<string, number[]>()
+
+// 等待特定 host 初始化完成的 Promise Map
+const hostInitPromises = new Map<string, { resolve: (tabId: number) => void; reject: (err: Error) => void }[]>()
+
+// 统一处理地址匹配键，去除末尾斜杠避免无法命中等待队列
+// 当传入非空字符串时，保证返回非空字符串
+const normalizeUrlKey = (value?: string): string | undefined => {
+  if (!value) return value
+  return value.endsWith('/') ? value.slice(0, -1) : value
+}
+
+// 将 sessionRegistry 挂载到 browser 对象上供 ExtensionClientTransport 使用
+;(browser as any).sessionRegistry = sessionRegistry
+;(browser as any).hostNameMap = hostNameMap
+
+// 暴露给 mcpServer 使用的等待函数
+;(browser as any).waitForHostInit = (url: string): Promise<number> => {
+  return new Promise((resolve, reject) => {
+    const normalizedUrl = normalizeUrlKey(url)
+
+    // 如果标准化后的 URL 为空，直接拒绝
+    if (!normalizedUrl) {
+      reject(new Error(`无效的 URL: ${url}`))
+      return
+    }
+
+    // 先检查是否已经存在
+    const existingTabIds = hostNameMap.get(normalizedUrl)
+    if (existingTabIds && existingTabIds.length > 0) {
+      resolve(existingTabIds[existingTabIds.length - 1])
+      return
+    }
+
+    // 将等待 Promise 按标准化后的地址存储，避免不同书写导致匹配失败
+    // 否则添加到等待队列
+    if (!hostInitPromises.has(normalizedUrl)) {
+      hostInitPromises.set(normalizedUrl, [])
+    }
+    hostInitPromises.get(normalizedUrl)!.push({ resolve, reject })
+
+    // 设置超时（30秒）
+    setTimeout(() => {
+      reject(new Error(`等待 ${normalizedUrl} 初始化超时`))
+    }, 30000)
+  })
+}
+
+export const useBrowserExtensions = async (remoterRef: Ref<InstanceType<typeof TinyRemoter>>) => {
+  /**
+   * 发现已存在的服务器
+   * Sidepanel 启动时，向所有标签页广播，请求已有的 MCP Server 重新注册
+   */
+  onMounted(async () => {
+    try {
+      console.log('【useBrowserExt】即将发送 sidepanel-ready 广播')
+      sendRuntimeMessage('sidepanel-ready', {}, 'side->content')
+    } catch (error) {
+      console.error('【useBrowserExt】 sidePanel onMounted 时，通知所有tabs 的任务中，有报错：', error as any)
+    }
+  })
+  // 注册队列：确保 MCP server 注册操作串行执行，避免并发时 closeAll() 导致冲突
+  let registerQueue = Promise.resolve()
+
+  const { clientTransport } = await createMcpServer()
+
+  // 首先加载sidepanel面板自身的mcpServer
+  registerQueue = registerQueue.then(async () => {
+    try {
+      const mcpServer = {
+        url: '本地工具'
+      }
+      const serverName = `mcp-server-localhost`
+
+      // 1、 插入McpServers, 此时内部会判断重复。  不重复则插入，并连接和查询tools到agent上。
+      const inserted = await remoterRef.value.agent.insertMcpServer(serverName, clientTransport as any)
+      if (inserted) {
+        await remoterRef.value.loadMcpServerToPlugin(serverName, mcpServer as McpServerConfig)
+      } else {
+        console.error(`【useBrowserExt】 mcpServer插件添加失败: localhost:3000`)
+      }
+    } catch (error) {
+      console.error(`【useBrowserExt】agent 注册插件失败: localhost:3000`, error as any)
+    }
+  })
+
+  onRuntimeMessage(
+    'mcp-server-register',
+    (data, sender) => {
+      const { sessionId, serverInfo } = data
+      const tabId: number = sender.tab!.id!
+
+      const existingSession = sessionRegistry.get(sessionId)
+
+      // 1.1 已存在该 sessionId，只需追加 tabId 后返回
+      if (existingSession) {
+        if (!existingSession.tabIds.includes(tabId)) {
+          existingSession.tabIds.push(tabId)
+        }
+        console.log('【useBrowserExt】tabId 已记录在sessionRegistry ')
+        return
+      }
+
+      // 1.2 新的 sessionId，创建记录并注册插件
+      sessionRegistry.set(sessionId, {
+        tabIds: [tabId],
+        serverInfo,
+        timestamp: Date.now()
+      })
+
+      // 1.3 串行执行： agent 添加 mcpServer, 更新侧边中的插件列表
+      registerQueue = registerQueue.then(async () => {
+        try {
+          const mcpServer = {
+            type: 'extension',
+            url: serverInfo.url,
+            sessionId
+          }
+          const serverName = `mcp-server-${sessionId}`
+
+          // 1、 插入McpServers, 此时内部会判断重复。  不重复则插入，并连接和查询tools到agent上。
+          const inserted = await remoterRef.value.agent.insertMcpServer(serverName, mcpServer as McpServerConfig)
+          if (inserted) {
+            await remoterRef.value.loadMcpServerToPlugin(serverName, mcpServer as McpServerConfig)
+            await remoterRef.value.agent.closeAll()
+            showToast(`插件已添加: ${serverInfo.url}`)
+            console.log(`【useBrowserExt】 mcpServer插件已添加: ${serverInfo.url}`)
+          } else {
+            console.error(`【useBrowserExt】 mcpServer插件添加失败: ${serverInfo.url}`)
+          }
+        } catch (error) {
+          console.error(`【useBrowserExt】agent 注册插件失败: ${sessionId}`, error as any)
+        }
+      })
+    },
+    'content->side'
+  )
+
+  // 监听 tab 关闭事件，清理映射
+  browser.tabs.onRemoved.addListener(async (tabId) => {
+    for (const [sessionId, info] of sessionRegistry.entries()) {
+      const index = info.tabIds.indexOf(tabId)
+      if (index !== -1) {
+        // 从数组中移除该 tabId
+        info.tabIds.splice(index, 1)
+        // 只有当所有 tabId 都关闭时，才删除插件
+        if (info.tabIds.length === 0) {
+          sessionRegistry.delete(sessionId)
+          const serverName = `mcp-server-${sessionId}`
+          await remoterRef.value.handleClientDisconnected(serverName) // ---> 转到 remoter内部方法去关闭client
+        }
+        break // ---> tabId 只能在一个sessionId下面，所以立即退出for
+      }
+    }
+
+    // 清理 hostNameMap 中的 tabId
+    for (const [host, tabIds] of hostNameMap.entries()) {
+      const index = tabIds.indexOf(tabId)
+      if (index !== -1) {
+        // 从数组中移除该 tabId（即使变为空数组也保留）
+        tabIds.splice(index, 1)
+        console.log(`【useBrowserExt】从 hostNameMap 移除 tabId: ${tabId}, host: ${host}`)
+        break
+      }
+    }
+  })
+
+  // 每次只调用最后激活的页面
+  browser.tabs.onActivated.addListener(async ({ tabId }) => {
+    for (const [sessionId, info] of sessionRegistry.entries()) {
+      const index = info.tabIds.indexOf(tabId)
+      if (index !== -1) {
+        // 从数组中移除该 tabId,之后追加在最后
+        info.tabIds.splice(index, 1)
+        info.tabIds.push(tabId)
+        break
+      }
+    }
+
+    // 维护 hostNameMap 中的 tabId 顺序
+    for (const [host, tabIds] of hostNameMap.entries()) {
+      const index = tabIds.indexOf(tabId)
+      if (index !== -1) {
+        // 从数组中移除该 tabId，之后追加在最后
+        tabIds.splice(index, 1)
+        tabIds.push(tabId)
+        console.log(`【useBrowserExt】hostNameMap 更新激活顺序, host: ${host}, tabId: ${tabId}`)
+        break
+      }
+    }
+  })
+
+  onRuntimeMessage(
+    'define-tool-from-content-to-sidepanel',
+    (data, sender) => {
+      const { host } = data
+      const { url } = sender
+      const tabId: number = sender.tab!.id!
+
+      const existingHost = hostNameMap.get(host)
+
+      // 已存在该 host，只需追加 tabId
+      if (existingHost) {
+        if (!existingHost.includes(tabId)) {
+          existingHost.push(tabId)
+        }
+        console.log('【useBrowserExt】tabId 已记录在 hostNameMap')
+      } else {
+        // 新的 host，创建 tabIds 数组
+        hostNameMap.set(host, [tabId])
+        console.log('【useBrowserExt】新 host 已添加到 hostNameMap')
+      }
+
+      console.log('【useBrowserExt】hostNameMap', hostNameMap)
+      // 触发等待队列中的 Promise
+      const normalizedUrl = normalizeUrlKey(url)
+      const waitingPromises = normalizedUrl ? hostInitPromises.get(normalizedUrl) : undefined
+      if (waitingPromises && waitingPromises.length > 0) {
+        waitingPromises.forEach(({ resolve }) => resolve(tabId))
+        hostInitPromises.delete(normalizedUrl!)
+        console.log(`【useBrowserExt】触发 ${normalizedUrl} 的等待队列，共 ${waitingPromises.length} 个`)
+      }
+    },
+    'content->side'
+  )
+}

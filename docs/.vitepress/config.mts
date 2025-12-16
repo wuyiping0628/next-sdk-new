@@ -2,8 +2,8 @@ import { defineConfig } from 'vitepress'
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
-  title: 'OpenTiny NEXT SDK',
-  description: 'OpenTiny NEXT SDK',
+  title: 'OpenTiny NEXT-SDKs',
+  description: 'OpenTiny NEXT-SDKs',
   base: '/next-sdk/',
   vite: {
     server: {
@@ -19,24 +19,20 @@ export default defineConfig({
       '/guide/': [
         {
           text: '介绍',
-          items: [
-            { text: '开始', link: '/guide/' },
-            { text: '为什么选 NEXT SDK', link: '/guide/why' }
-          ]
+          items: [{ text: '开始', link: '/guide/' }]
         },
         {
           text: '指引',
           items: [
-            { text: '远程连接 WebAgent 服务器', link: '/guide/connect-web-agent' },
-            { text: '通过 MCP Host 操控 Web 应用', link: '/guide/mcp-host' },
+            { text: '接入三方 AI 应用', link: '/guide/mcp-host' },
             { text: 'Electron 应用接入', link: '/guide/electron' },
             { text: 'uni-app 应用接入', link: '/guide/uni-app' },
             { text: '本地连接', link: '/guide/connect-local' },
-            { text: '常见问题', link: '/guide/faq' }
+            { text: 'WebAgent 私有化部署', link: '/guide/web-agent-private-deployment' }
           ]
         },
         {
-          text: 'NEXT SDK API',
+          text: 'NEXT-SDKs API',
           items: [
             { text: 'WebMcpClient 类', link: '/guide/api-client' },
             { text: 'WebMcpServer 类', link: '/guide/api-server' },
@@ -47,11 +43,24 @@ export default defineConfig({
         },
         {
           text: 'TinyRemoter for Vue',
-          items: [{ text: 'TinyRobot版本', link: '/remoter-ui/tiny-robot-remoter' }]
+          items: [
+            { text: 'TinyRobot 版本', link: '/guide/tiny-robot-remoter' },
+            { text: 'custom llm 自定义大模型', link: '/guide/custom-llm' },
+            { text: 'useNextAgent 函数', link: '/guide/use-next-agent' }
+          ]
+        },
+        {
+          text: 'AI Extension',
+          items: [
+            { text: 'architecture 技术架构', link: '/guide/ai-extension-architecture' },
+            { text: 'mcp-servers 工具开发指南', link: '/guide/ai-extension-next-wxt' },
+            { text: 'skills 技能开发指南', link: '/guide/ai-extension-skills' },
+            { text: 'AI Extension 插件安装指南', link: '/guide/ai-extension-install' }
+          ]
         }
       ]
     },
 
-    socialLinks: [{ icon: 'github', link: 'https://github.com/opentiny/next-sdk' }]
+    socialLinks: [{ icon: 'github', link: 'https://github.com/opentiny' }]
   }
 })
